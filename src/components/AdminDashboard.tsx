@@ -47,6 +47,8 @@ interface Order {
   mockup_url?: string;
   payment_screenshot_urls?: string[];
   payment_screenshot_url?: string;
+  order_mode: string;
+  cod_amount?: string | null;
 }
 
 const getFileExtension = (url: string) => url.split('.').pop() || 'file';
@@ -93,6 +95,20 @@ const AdminDashboardContent = () => {
       const from = (currentPage - 1) * itemsPerPage;
       const to = from + itemsPerPage - 1;
 
+      // Get total count first
+      const { count, error: countError } = await supabase
+        .from('orders')
+        .select('*', { count: 'exact', head: true });
+
+      if (countError) throw countError;
+
+      // Validate pagination
+      const totalPages = Math.ceil((count || 0) / itemsPerPage);
+      if (currentPage > totalPages && totalPages > 0) {
+        setCurrentPage(totalPages);
+        return;
+      }
+
       let query = supabase
         .from('orders')
         .select('*')
@@ -111,7 +127,7 @@ const AdminDashboardContent = () => {
       setOrders(data || []);
     } catch (err) {
       console.error('Error fetching orders:', err);
-      toast.error('Failed to load orders');
+      toast.error('Failed to load orders. Please try again.');
     } finally {
       setIsLoading(false);
     }
@@ -121,13 +137,33 @@ const AdminDashboardContent = () => {
 
   const updateOrderStatus = async (orderId: string, newStatus: string) => {
     try {
-      setOrders(prev => prev.map(order => 
+      // Validate status
+      const validStatuses = [
+        'pending',
+        'processing',
+        'printing',
+        'packed',
+        'dispatched',
+        'error_occurred',
+        'delay_in_printing',
+        'half_payment_verification',
+        'payment_verification'
+      ] as const;
+
+      type ValidStatus = typeof validStatuses[number];
+
+      if (!validStatuses.includes(newStatus as ValidStatus)) {
+        throw new Error('Invalid status');
+      }
+
+      // Optimistic update
+      setOrders((prev: Order[]) => prev.map((order: Order) => 
         order.id === orderId ? { ...order, status: newStatus } : order
       ));
 
       const { error } = await supabase
         .from('orders')
-        .update({ status: newStatus })
+        .update({ status: newStatus, updated_at: new Date().toISOString() })
         .eq('id', orderId);
 
       if (error) throw error;
@@ -135,6 +171,7 @@ const AdminDashboardContent = () => {
     } catch (err) {
       console.error('Error updating status:', err);
       toast.error('Failed to update status');
+      // Revert optimistic update
       fetchOrders();
     }
   };
@@ -550,16 +587,62 @@ const OrderDetails = ({ order, onClose, setDownloadQueue }: {
   }, [order.id]);
 
   const downloadSingleFile = async (url: string, type: string, index: number) => {
+    const downloadId = Math.random().toString(36).substring(7);
+    const progressItem: DownloadProgress = { 
+      id: downloadId, 
+      orderId: order.order_id, 
+      progress: 0 
+    };
+    
     try {
+      setDownloadQueue((prev: DownloadProgress[]) => [...prev, progressItem]);
+
       const response = await fetch(url);
       if (!response.ok) throw new Error('Download failed');
-      const blob = await response.blob();
+
+      const contentLength = response.headers.get('content-length');
+      const total = parseInt(contentLength || '0', 10);
+      let loaded = 0;
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('Failed to initialize download');
+
+      const chunks: Uint8Array[] = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        loaded += value.length;
+        
+        // Update progress
+        const progress = total ? Math.round((loaded / total) * 100) : 0;
+        setDownloadQueue((prev: DownloadProgress[]) => 
+          prev.map((item: DownloadProgress) => 
+            item.id === downloadId ? { ...item, progress } : item
+          )
+        );
+      }
+
+      // Combine chunks and create blob
+      const blob = new Blob(chunks);
+      const extension = getFileExtension(url);
+      const filename = `${order.order_id}_${type}_${index + 1}.${extension}`;
+      
+      // Create download link
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
-      link.download = `${order.order_id}_${type}_${index+1}.${getFileExtension(url)}`;
+      link.download = filename;
+      document.body.appendChild(link);
       link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+
+      // Remove from queue after successful download
+      setDownloadQueue((prev: DownloadProgress[]) => prev.filter((item: DownloadProgress) => item.id !== downloadId));
     } catch (error) {
-      toast.error('File download failed');
+      console.error('Download error:', error);
+      toast.error(`Failed to download ${type} file ${index + 1}`);
+      setDownloadQueue((prev: DownloadProgress[]) => prev.filter((item: DownloadProgress) => item.id !== downloadId));
     }
   };
 
@@ -621,6 +704,10 @@ const OrderDetails = ({ order, onClose, setDownloadQueue }: {
               <p><span className="font-medium">Status:</span> {order.status}</p>
               <p><span className="font-medium">Created:</span> {format(new Date(order.created_at), 'PPpp')}</p>
               <p><span className="font-medium">Payment Info:</span> {order.payment_info}</p>
+              <p><span className="font-medium">Order Mode:</span> {order.order_mode}</p>
+              {order.order_mode === 'COD' && order.cod_amount && (
+                <p><span className="font-medium">COD Amount:</span> ₹{order.cod_amount}</p>
+              )}
               {order.tracking_link && (
                 <p><span className="font-medium">Tracking:</span> {order.tracking_link}</p>
               )}
@@ -825,7 +912,3 @@ const AdminDashboard = () => (
 );
 
 export default AdminDashboard;
-
-export default AdminDashboard
-
-export default AdminDashboard
